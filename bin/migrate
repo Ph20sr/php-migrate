@@ -1,0 +1,94 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use Ph20sr\Migrate\Migrator;
+
+foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php'] as $autoload) {
+    if (is_file($autoload)) {
+        require $autoload;
+        break;
+    }
+}
+
+const USAGE = <<<TXT
+Uso: migrate <comando> [opções]
+
+Comandos:
+  status                 lista applied / pending / changed / missing
+  up                     aplica as pendentes
+  down [passos]          desfaz as últimas migrations (padrão: 1)
+  new <nome>             cria migrations/AAAAMMDD_HHMMSS_<nome>.sql
+
+Opções:
+  --dir=<pasta>          pasta das migrations (padrão: ./migrations)
+  --table=<tabela>       tabela de controle (padrão: schema_migrations)
+  --dry-run              (up) só mostra o que seria aplicado
+  --allow-out-of-order   (up) aceita pendentes mais antigas que a última aplicada
+
+Conexão via variáveis de ambiente: DB_DSN, DB_USER, DB_PASS
+  ex.: DB_DSN="mysql:host=127.0.0.1;dbname=app;charset=utf8mb4"
+
+TXT;
+
+$args = array_slice($argv, 1);
+$options = [];
+$positional = [];
+foreach ($args as $arg) {
+    if (preg_match('/^--([a-z-]+)(?:=(.*))?$/', $arg, $m)) {
+        $options[$m[1]] = $m[2] ?? true;
+    } else {
+        $positional[] = $arg;
+    }
+}
+$command = $positional[0] ?? 'help';
+$dir = (string) ($options['dir'] ?? getcwd() . '/migrations');
+$table = (string) ($options['table'] ?? 'schema_migrations');
+$out = static fn (string $line) => fwrite(STDOUT, $line . PHP_EOL);
+
+if ($command === 'help' || isset($options['help'])) {
+    fwrite(STDOUT, USAGE);
+    exit(0);
+}
+
+try {
+    if ($command === 'new') {
+        // "new" não precisa de banco
+        $pdo = new PDO('sqlite::memory:');
+        $path = (new Migrator($pdo, $dir, $table))->create(implode(' ', array_slice($positional, 1)));
+        $out("Criada: {$path}");
+        exit(0);
+    }
+
+    $dsn = getenv('DB_DSN') ?: throw new RuntimeException('Defina DB_DSN (veja migrate help)');
+    $pdo = new PDO($dsn, getenv('DB_USER') ?: null, getenv('DB_PASS') ?: null);
+    $migrator = new Migrator($pdo, $dir, $table, $out);
+
+    switch ($command) {
+        case 'status':
+            $icons = ['applied' => '✔', 'pending' => '·', 'changed' => '✖', 'missing' => '?'];
+            $exit = 0;
+            foreach ($migrator->status() as $row) {
+                $out(sprintf('%s %-14s %-40s %s', $icons[$row['state']], $row['version'], $row['name'], $row['state']));
+                if (in_array($row['state'], ['changed', 'missing'], true)) {
+                    $exit = 1;
+                }
+            }
+            exit($exit);
+        case 'up':
+            $done = $migrator->migrate((bool) ($options['allow-out-of-order'] ?? false), (bool) ($options['dry-run'] ?? false));
+            $out($done === [] ? 'Nada a aplicar.' : count($done) . ' migration(s) aplicada(s).');
+            exit(0);
+        case 'down':
+            $done = $migrator->rollback((int) ($positional[1] ?? 1));
+            $out(count($done) . ' migration(s) revertida(s).');
+            exit(0);
+        default:
+            fwrite(STDERR, "Comando desconhecido: {$command}\n\n" . USAGE);
+            exit(2);
+    }
+} catch (Throwable $e) {
+    fwrite(STDERR, 'Erro: ' . $e->getMessage() . PHP_EOL);
+    exit(1);
+}
